@@ -15,6 +15,9 @@ dP(shift)/dε 在 ε=0 处精确右导数的**丰度灵敏度**接口（符号�
 在若干时点区间观测下给出联合概率与各步分子重同位素数的条件分布），
 以及同一交换模型下的**流失次数**统计接口（每步使分子重同位素数减少 1 的交换
 计一次流失，给出全部观测的联合概率与总流失次数的完整条件分布），
+以及同一交换模型下**首达阈值时刻**的推断接口（分子重同位素数首次达到 threshold 的
+时刻；达标后回落仍以首次达标时刻为准，给出全部观测的联合概率、首达时刻完整条件
+分布与截至 steps 未达标的概率），
 同样全程精确有理数运算。
 
 ## 启动
@@ -971,6 +974,112 @@ curl -s -X POST http://localhost:8000/v1/exchange-turnover \
   }'
 ```
 
+### `POST /v1/exchange-first-passage`
+
+**有限浴池交换首达时刻**推断：交换动力学、`n`、`m`、`h`、`b`、`steps`、
+`observations` 各字段与严格校验和 `/v1/exchange-trajectory` 完全相同
+（分子 `n` 个位点、浴池 `m` 个位点，每步均匀且独立地各选一位点交换，`n·m` 个位点对
+等概率，**同类交换也计步**，总重同位素数 `h + b` 守恒）。另设严格整数 `threshold`
+（`0 ≤ threshold ≤ n`）：令分子重同位素数首次满足 `X_t ≥ threshold` 的时刻为首达时刻，
+`h ≥ threshold` 时首达时刻为 `0`；**一旦达标，之后即使重同位素数回落到 threshold 以下，
+首达时刻仍记为首次达标那一步**。返回全部观测同时成立的**联合概率**；非零时给出在全部
+观测条件下首达时刻的**完整条件分布**（各可能步的概率），以及截至第 `steps` 步始终未
+达标的概率。全程精确整数权重递推，**不用边缘分布推算、不枚举交换路径、不做随机估计**。
+
+请求体（达标后回落示例）：
+
+```json
+{
+  "n": 2,
+  "m": 2,
+  "h": 1,
+  "b": 1,
+  "steps": 2,
+  "threshold": 2,
+  "observations": [
+    {"step": 2, "lower": 1, "upper": 1}
+  ]
+}
+```
+
+字段与约束（任一不满足即返回 **422**）：
+
+| 字段 | 约束 |
+| --- | --- |
+| `n` / `m` | 严格整数，1～40（分子 / 浴池位点数） |
+| `h` / `b` | 严格整数，`0 ≤ h ≤ n`、`0 ≤ b ≤ m`（各自初始重同位素数） |
+| `steps` | 严格整数，0～80 |
+| `threshold` | 严格整数，`0 ≤ threshold ≤ n` |
+| `observations` | 0～8 条；各 `step` **互异** |
+| `observations[].step` | 严格整数，`0 ≤ step ≤ steps` |
+| `observations[].lower` / `upper` | 严格整数，`0 ≤ lower ≤ upper ≤ n` |
+
+响应（200）。观测联合概率非零时：
+
+```json
+{
+  "probability": "3/4",
+  "first_hit_distribution": [
+    {"step": 1, "probability": "1/3"}
+  ],
+  "never_probability": "2/3"
+}
+```
+
+无观测时的示例（`n = m = 2`、`h = b = 1`、`steps = 2`、`threshold = 2`）：
+
+```json
+{
+  "probability": "1/1",
+  "first_hit_distribution": [
+    {"step": 1, "probability": "1/4"},
+    {"step": 2, "probability": "1/8"}
+  ],
+  "never_probability": "5/8"
+}
+```
+
+观测联合概率为零时（省略 `first_hit_distribution` 与 `never_probability`）：
+
+```json
+{"probability": "0/1"}
+```
+
+- `probability`：全部观测同时成立的联合概率，已约分的 `"n/d"`；无观测时恒为 `"1/1"`。
+- `first_hit_distribution`：在**全部观测条件下**首达时刻的完整条件分布，**仅列概率非零的
+  步**并按 `step` 升序；每项 `probability` 为已约分的 `"n/d"`。首达时刻为 0 时恒为
+  `[{"step": 0, "probability": "1/1"}]`；各步概率与 `never_probability` 之和恒为 `1/1`。
+  仅在 `probability` 非零时返回。
+- `never_probability`：在全部观测条件下，截至第 `steps` 步分子重同位素数从未达到
+  threshold 的条件概率，已约分的 `"n/d"`；阈值在轨迹中根本不可达（如分子与浴池均无重
+  同位素而 `threshold ≥ 1`）时恒为 `"1/1"` 且 `first_hit_distribution` 为 `[]`。
+
+上例中 `n = m = 2`、`h = b = 1`（总重同位素数 2）：从 `X_0 = 1` 出发，每步 4 个位点对中
+上移、不动、下移各占 1、2、1 对。观测 `X_2 = 1` 保留三条等权重路径：
+`1 → 1 → 1`（权重 4，**从未达标**）、`1 → 2 → 1`（权重 4，**第 1 步达标**，第 2 步回落但
+首达时刻仍为 1）、`1 → 0 → 1`（权重 4，**从未达标**），故联合概率为 `(4+4+4)/4² = 3/4`，
+条件下首达第 1 步概率为 `1/3`、从未达标为 `2/3`。无观测时首达 2 只能经上移发生：第 1 步
+直接上移概率 `1/4`，第 2 步才首达需先不动再上移 `2/4 × 1/4 = 1/8`，其余 `5/8` 在两步内
+未达标。
+
+### 调用示例
+
+```bash
+curl -s -X POST http://localhost:8000/v1/exchange-first-passage \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "n": 2,
+    "m": 2,
+    "h": 1,
+    "b": 1,
+    "steps": 2,
+    "threshold": 2,
+    "observations": [
+      {"step": 2, "lower": 1, "upper": 1}
+    ]
+  }'
+```
+
 ### `GET /healthz`
 
 健康检查，返回 `{"status": "ok"}`。
@@ -1079,6 +1188,18 @@ DP 全程在整数上进行；最优窗口端点必落在**权重为正**的格�
 次数的条件概率只做一次约分 `weight_c / z`；联合概率为零时返回
 `probability="0/1"` 并省略 `distribution`，全程不枚举任何交换路径。
 
+`/v1/exchange-first-passage` 同样复用生灭链整数转移分子（up/down/stay，分母同为
+`n·m`），把前向递推的状态扩展为**（重同位素数 x, 首达标记 tag）二元组**：尚未达标时
+tag 取保留值 `steps+1`，达标后 tag 冻结为首次达标步；`α_t(x, tag) =
+A_t[(x, tag)] / (n·m)^t`。初始状态按 `h ≥ threshold` 与否标记为 0 或未达标；递推中
+未达标状态经上移首次进入 `x+1 ≥ threshold` 时把 tag 置为当前步 t（下移不可能首次
+达标，同类交换在未达标时同样不会达标），已达标状态的任何转移（**包括达标后回落**）
+都保持 tag 不变，因此首达时刻只记首次。每个观测时点把违反区间的状态（无论是否已
+达标）置零。第 `steps` 步的剩余质量即联合概率 `z / (n·m)^steps`，汇总各 tag 的质量：
+首达第 s 步的条件概率为一次约分 `weight_s / z`，未达标 tag 的质量给出
+`never_probability`，二者之和恒为 1；联合概率为零时只返回 `probability="0/1"`，
+全程不枚举任何交换路径，也不由重同位素数的边缘分布反推首达时刻。
+
 ## 测试
 
 ```bash
@@ -1095,13 +1216,14 @@ pytest
 全部（同位素取值 × 无放回子集）路径的暴力求解器的随机对拍、丰度灵敏度与逐路径
 枚举"每个原子概率为 ε 的一次多项式"（截断到 ε 的一次项）的暴力求导器的随机对拍、
 交换轨迹与枚举全部 `(n·m)^steps` 个位点选取序列（逐序列模拟重同位素位点集合）的
-暴力求解器的随机对拍、交换流失次数与逐序列累计流出次数的暴力求解器的随机对拍，
-以及全部非法输入的 422 用例。
+暴力求解器的随机对拍、交换流失次数与逐序列累计流出次数的暴力求解器的随机对拍、
+交换首达时刻与逐序列记录首次 `X_t ≥ threshold` 步（达标后回落实测）的暴力求解器的
+随机对拍，以及全部非法输入的 422 用例。
 
 ## 项目结构
 
 ```
-app/main.py          # FastAPI 应用：校验模型 + 精确卷积 + 精确有理数 LP + 带符号权重窗口 DP（采集/判别共用）+ 检出概率 DP + 候选/偏移后验 + 碎片谱 + 丰度灵敏度符号求导 + 交换轨迹前向-后向精确推断 + 交换流失次数（重同位素数, 流失次数）联合状态整数递推
+app/main.py          # FastAPI 应用：校验模型 + 精确卷积 + 精确有理数 LP + 带符号权重窗口 DP（采集/判别共用）+ 检出概率 DP + 候选/偏移后验 + 碎片谱 + 丰度灵敏度符号求导 + 交换轨迹前向-后向精确推断 + 交换流失次数（重同位素数, 流失次数）联合状态整数递推 + 交换首达时刻（重同位素数, 首达步冻结标记）联合状态整数递推
 tests/test_envelope.py
 tests/test_peak_attribution.py
 tests/test_mixture_bounds.py
@@ -1113,6 +1235,7 @@ tests/test_fragment_spectrum.py
 tests/test_abundance_sensitivity.py
 tests/test_exchange_trajectory.py
 tests/test_exchange_turnover.py
+tests/test_exchange_first_passage.py
 requirements.txt     # 运行依赖
 requirements-dev.txt # 测试依赖
 Dockerfile
