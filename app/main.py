@@ -52,6 +52,15 @@ same-type swaps and up transitions add nothing, and it returns the exact
 joint probability of the observations together with the exact conditional
 distribution of the total loss count over the whole trajectory, tracked
 as an extra dimension of the same integer-weight forward recursion.
+A twelfth endpoint computes first-passage times in the same finite-bath
+exchange: the first step at which the molecule heavy count reaches a
+threshold (0 when the initial count already does, and falling back below
+the threshold afterwards does not undo the hit), returning the exact
+joint probability of the observations and, conditioned on all of them,
+the exact distribution of the first-hit step together with the
+probability of never reaching the threshold within the horizon, again
+tracked as an extra dimension of the same integer-weight forward
+recursion.
 """
 
 from __future__ import annotations
@@ -547,6 +556,35 @@ class ExchangeTurnoverResponse(BaseModel):
     # observations; non-zero entries ascending by count. Omitted when the
     # observations have joint probability zero.
     distribution: Optional[List[TurnoverCountPeak]] = None
+
+
+class ExchangeFirstPassageRequest(ExchangeTrajectoryRequest):
+    """Trajectory fields plus the heavy-count threshold to first reach."""
+
+    threshold: int = Field(strict=True, ge=0)
+
+    @model_validator(mode="after")
+    def _validate_threshold(self) -> "ExchangeFirstPassageRequest":
+        if self.threshold > self.n:
+            raise ValueError("threshold must satisfy 0 <= threshold <= n")
+        return self
+
+
+class FirstHitPeak(BaseModel):
+    step: int
+    probability: str  # reduced fraction "n/d"
+
+
+class ExchangeFirstPassageResponse(BaseModel):
+    probability: str  # reduced fraction "n/d"
+    # Conditional law of the first step at which the molecule heavy count
+    # reaches the threshold, given all observations; non-zero entries
+    # ascending by step. Omitted when the observations have joint
+    # probability zero.
+    first_hit_distribution: Optional[List[FirstHitPeak]] = None
+    # Conditional probability of never reaching the threshold within
+    # steps 0..steps; the distribution entries and this value sum to 1.
+    never_probability: Optional[str] = None
 
 
 def convolve(left: Distribution, right: Distribution) -> Distribution:
@@ -1634,7 +1672,113 @@ def exchange_turnover(
     return probability, distribution
 
 
-app = FastAPI(title="Isotope Envelope API", version="1.10.0")
+def exchange_first_passage(
+    n: int,
+    m: int,
+    h: int,
+    b: int,
+    steps: int,
+    observations: List[Tuple[int, int, int]],
+    threshold: int,
+) -> Tuple[Fraction, Optional[Dict[int, Fraction]], Optional[Fraction]]:
+    """Exact first-passage inference for the finite-bath exchange, over Q.
+
+    The exchange dynamics are exactly those of ``exchange_trajectory``:
+    each step picks one of the ``n*m`` (molecule site, bath site) pairs
+    uniformly and swaps (same-type swaps count as steps), so the molecule
+    heavy count X_t is a birth-death chain with integer transition
+    numerators up/down/stay over the common denominator ``n*m``. The
+    first-passage time tau is the first step at which X_t >= ``threshold``
+    (tau = 0 when the initial count h already qualifies); once the
+    threshold has been reached, falling back below it does not undo the
+    hit. ``observations`` lists ``(step, lower, upper)`` constraints on
+    X_t at distinct steps (step 0 is the initial state X_0 = h). Returns
+    the exact joint probability of all observations and, when it is
+    non-zero, the exact conditional distribution of tau over 0..steps
+    given all of them as a step -> probability mapping together with the
+    conditional probability of never reaching the threshold within the
+    horizon; a zero joint probability yields ``(0, None, None)``.
+
+    The forward recursion carries exact integer weights keyed by the
+    joint state (heavy count, first-hit step): A_t[(x, tau)] with
+    alpha_t(x, tau) = A_t[(x, tau)] / (n*m)**t, where tau = -1 marks
+    "threshold not reached yet" and zeroing every state that violates
+    the observation at its step. A not-yet-hit state that crosses the
+    threshold on step t moves to tau = t; states already carrying a
+    first-hit step keep it whatever the later counts are, so a path
+    that reaches the threshold and falls back is still credited with
+    its first reaching time. Paths whose first hit happens at different
+    steps occupy distinct cells and are merged only when the tau
+    marginal is read off. The remaining mass at step ``steps`` gives
+    the joint probability ``z / (n*m)**steps`` and each conditional
+    probability is the single Fraction reduction ``weight / z``; the
+    never-hit mass is the surviving tau = -1 weight. No exchange
+    sequence is ever enumerated.
+    """
+    total = h + b  # conserved heavy-isotope count (molecule + bath)
+    denom = n * m  # every one-step transition has this denominator
+
+    # Integer transition numerators at molecule heavy count x.
+    ups = [(n - x) * (total - x) for x in range(n + 1)]
+    downs = [x * (m - total + x) for x in range(n + 1)]
+    stays = [denom - ups[x] - downs[x] for x in range(n + 1)]
+
+    filters = {step: (lower, upper) for step, lower, upper in observations}
+
+    # Forward pass over exact integer weights keyed by (heavy count x,
+    # first-hit step tau): alpha_t(x, tau) = current[(x, tau)] / denom**t,
+    # with states violating an observation zeroed at its step. tau = -1
+    # marks "threshold not reached yet"; such states always have
+    # x < threshold.
+    current: Dict[Tuple[int, int], int] = {
+        (h, 0 if h >= threshold else -1): 1
+    }
+    if 0 in filters:
+        lower, upper = filters[0]
+        if not lower <= h <= upper:
+            current = {}
+    for t in range(1, steps + 1):
+        nxt: Dict[Tuple[int, int], int] = {}
+        for (x, tau), weight in current.items():
+            for nx, num in ((x, stays[x]), (x + 1, ups[x]), (x - 1, downs[x])):
+                if not num:
+                    continue
+                if tau < 0 and nx >= threshold:
+                    ntau = t  # first reaching of the threshold
+                else:
+                    ntau = tau
+                key = (nx, ntau)
+                nxt[key] = nxt.get(key, 0) + weight * num
+        if t in filters:
+            lower, upper = filters[t]
+            nxt = {
+                key: w for key, w in nxt.items() if lower <= key[0] <= upper
+            }
+        current = nxt
+
+    z_num = sum(current.values())
+    if z_num == 0:
+        return Fraction(0), None, None
+    probability = Fraction(z_num, denom**steps)
+
+    # Marginalize the heavy count: each first-hit step's conditional weight
+    # is reduced exactly once against the surviving total mass; the tau = -1
+    # weight is the probability of never reaching the threshold by `steps`.
+    hits: Dict[int, int] = {}
+    never_weight = 0
+    for (_x, tau), weight in current.items():
+        if tau < 0:
+            never_weight += weight
+        else:
+            hits[tau] = hits.get(tau, 0) + weight
+    distribution = {
+        tau: Fraction(weight, z_num) for tau, weight in hits.items() if weight
+    }
+    never = Fraction(never_weight, z_num)
+    return probability, distribution, never
+
+
+app = FastAPI(title="Isotope Envelope API", version="1.11.0")
 
 
 @app.post("/v1/envelope", response_model=EnvelopeResponse)
@@ -1907,6 +2051,40 @@ def compute_exchange_turnover(
             TurnoverCountPeak(count=count, probability=to_fraction_str(prob))
             for count, prob in sorted(distribution.items())
         ],
+    )
+
+
+@app.post(
+    "/v1/exchange-first-passage",
+    response_model=ExchangeFirstPassageResponse,
+    response_model_exclude_none=True,
+)
+def compute_exchange_first_passage(
+    request: ExchangeFirstPassageRequest,
+) -> ExchangeFirstPassageResponse:
+    observations = [
+        (obs.step, obs.lower, obs.upper) for obs in request.observations
+    ]
+    probability, distribution, never = exchange_first_passage(
+        request.n,
+        request.m,
+        request.h,
+        request.b,
+        request.steps,
+        observations,
+        request.threshold,
+    )
+    if distribution is None:
+        return ExchangeFirstPassageResponse(
+            probability=to_fraction_str(probability)
+        )
+    return ExchangeFirstPassageResponse(
+        probability=to_fraction_str(probability),
+        first_hit_distribution=[
+            FirstHitPeak(step=step, probability=to_fraction_str(prob))
+            for step, prob in sorted(distribution.items())
+        ],
+        never_probability=to_fraction_str(never),
     )
 
 
